@@ -1,0 +1,20 @@
+'use strict';
+var plotly = require('plotly')('Kipper123', '0gb0qrvchc');
+var five = require("johnny-five");
++ar board = new five.Board();
+
+var data = [{x:[], y:[], stream:{token:'4npov9wfaz', maxpoints: 200}}];
+var layout = {fileopt: 'extend', filename: 'tmp36 nodey arduino!'};
+
+board.on("ready", function() {
+
+  // create a new tmp36 sensor object
+
+  var tmp36 = new five.Sensor({
+    pin: "A0",
+    freq: 1000, // get reading every 1000 ms
+    thresh: 0.5
+  });
+
+  var counter = 0
+
