@@ -1,11 +1,10 @@
-/*jslint browser: false, node: true, devel: true, indent: 2, maxlen: 82 */
+/*jslint browser: false, node: true, devel: true, todo: false, indent: 2, maxlen: 82 */
 /* jshint bitwise: true, curly: true, eqeqeq: true, es3: false,
    forin: true, freeze: true, futurehostile: true, latedef: true,
    maxcomplexity: 8, maxstatements: 35, noarg: true, nocomma: true,
    noempty: true, nonew: true, singleGroups: true, undef: true, unused: true,
    plusplus: true, strict: true, browser: true, devel: true
 */
-/*global net */
 'use strict';
 
 var five = require('johnny-five');
@@ -29,12 +28,12 @@ var layout = {
 };
 
 var nTraces = 2;        // number of data feeds
-var maxData = 200;      // number of data points displayed on graph
+var maxData = 200;      // number of data points displayed on streaming graph
 
 var waterTime = 10000;  // time for watering event (ms) - 10 seconds
-var dryValue = 700;     // sensor value that triggers a watering event
-var hardwareDelay = 1000; // minimum delay (ms) between slave hareward setting
+var hardwareDelay = 1000; // minimum delay (ms) between slave hardware setting
                         // operations (that change power usage)
+var heartRate = 30000;  // once every 30 seconds
 
 var off = [0, 2];
 var on = [1, 3];
@@ -51,15 +50,14 @@ var plotlyData = [
 var pump = null;
 var counter = 0;
 var wateringControls = [];
-var valves = [];
-var done = [false, true];
+var waitingQueue = [];
 
 ///////////////////////////////////////////////////////////////
 // Create functions that will be referenced later in the code //
 ///////////////////////////////////////////////////////////////
 
 // Only needs refresh twice a year, to handle daylight savings time changes
-var tzOffset = new Date().getTimezoneOffset() * 1000;// milliseconds from GMT
+var tzOffset = new Date().getTimezoneOffset() * 60000;// milliseconds from GMT
 /***
  * get a time value for the local (server) timezone
  *
@@ -94,6 +92,9 @@ function delay(millis) {
   do {
     curDate = new Date();
   } while (curDate - date < millis);
+  // TODO: do heartbeat every 30 seconds while waiting??  Only needed if delay
+  // can get > heartRate (nothing currently does)
+  // doHeartbeat();
 }// ./function delay(millis)
 
 /***
@@ -144,16 +145,18 @@ function allClosedOff(logIt) {
  * @return {undefined}
  */
 function initializeHardware() {
-  var analogPin, solenoidPin, pumpPin, loopTime, i, controlPair;
+  var analogPin, solenoidPin, pumpPin, loopTime, dryValue,
+    i, controlPair;
   // Constants (only) needed by this function
   analogPin = ['A0', 'A1'];
   solenoidPin = [1, 3];
   pumpPin = 8;
   loopTime = 120000;  // time between sampling (ms) - 2 minutes
+  dryValue = 700;     // maximum sensor value that triggers a watering event
 
   // Associate input (moisture) sensors with the solenoid that controls the
   // the water for that area.
-  for (i = 0; 0 < nTraces; i += 1) {
+  for (i = 0; i < nTraces; i += 1) {
     controlPair = {
       moistureSensor: new five.Sensor({
         pin: analogPin[i],
@@ -168,13 +171,11 @@ function initializeHardware() {
       index: i
     };
     // Setup a limit for 'too dry, needs water'
-    controlPair.booleanAt(dryValue);
-    // TODO: move dryValue to local constants
+    controlPair.moistureSensor.booleanAt(dryValue);
 
     wateringControls.push(controlPair);
     console.log('Sensor and solenoid', i, 'initialized');
   }
-  //
 
   // initialize the pump
   //pump = new five.Pin(pumpPin);
@@ -190,55 +191,27 @@ function initializeHardware() {
 }// ./function initializeHardware()
 
 /***
- * Mark a change in watering state for a trace at the current time
- *
- * Send the 2 passed trace values for the specified control set, both for the
- * same (current) time, to get a nice square corner in the trace
- * when watering is turned on or off.
+ * Send a single data point to the stream configured for a control set
  *
  * @param {object} set        control set information
- * @param {integer} oldValue  The trace value for the old state
- * @param {integer} newValue  The trace value for the new state
- * @return {undefined}
+ * @param {array} state       The trace values for the state
+ * @param {string} time       The time value for the data point
+ * @return {object}
  */
-function sendChange(set, oldValue, newValue) {
-  var data;
-
-  // Repeat the current state value, at the new (current) time
-  data = {
-    x: getDateString(),
-    y: oldValue
+function sendTracePoint(set, state, time) {
+  var data = {
+    x: time,
+    y: state[set.index]
   };
   set.stream.write(JSON.stringify(data) + '\n');
+  // Make sure do not get multiple points sent too close together.  Probably
+  // not needed, since documentation says there is some buffering.  Should never
+  // be more than 4 data points in close succesion, and the (plotly server)
+  // buffer should be able to handle that much.
   delay(100);
-  // Same (x) timestamp, new y state value
-  data.y = newValue;
-  set.stream.write(JSON.stringify(data) + '\n');
-  delay(100);
-
-  // Report the first few streamed data points
   consoleLogger(counter, set.index, data);
-}// ./function sendChange(set)
-
-/***
- * Add a point to the trace to show checked, but no more water needed yet
- *
- * @param {object} set        control set information
- * @return {undefined}
- */
-function sendStillOff(set) {
-  var data;
-
-  // Repeat the current state value, at the new (current) time
-  data = {
-    x: getDateString(),
-    y: off[set.index]
-  };
-  set.stream.write(JSON.stringify(data) + '\n');
-  delay(100);
-
-  consoleLogger(counter, set.index, data);
-}// ./sendStillOff(set)
+  return data;
+}// ./function sendTracePoint(set, state, time)
 
 /***
  * Give the plants some water
@@ -266,40 +239,34 @@ function waterPlants(set) {
  * @return {undefined}
  */
 function controlMoisture(controlSet) {
-  var set, othersDone;
-  // Report which control set is being processed, and the state of all other
-  // controls sets
-  othersDone = true;
-  for (set = 0; set < nTraces; set += 1) {
-    if (set !== controlSet.index) {
-      console.log('Processing set', controlSet.index, ', done[' + set + '] =',
-        done[set]);
-    }
-  }
+  var set, data;
+  console.log('controlMoisture for set', controlSet.index);
 
-  // TODO: setup a fifo queue to process waiting controls sets
-  //waitingQueue.push(controlSet.index);
-  //while (waitingQueue[0] !== controlsSet.index) {}
-  while (othersDone() === false) {
+  // NOTE: current testing says queueing is not really needed.  Despite the event
+  // 'model' being used, all events are sequential: processing of a received
+  // event completes before the next event is received, though they were
+  // 'triggered' at the same time.
+  // Guessing that the library is walking a loop, and doing 'callback' when
+  // conditions match.  The callback function has to return before the next
+  // event can get checked for.
+  waitingQueue.push(controlSet.index);
+  console.log('Current queue length:', waitingQueue.length);
+  while (waitingQueue[0] !== controlSet.index) {
     // Some other control set is processing
     delay(waterTime);
     console.log('delayed checking for set', controlSet.index);
-    // TODO: Report waiting queue sequence
   }
-  // Could still get a race condition, if more than one set was waiting to
-  // be processed, and they all try to start at once.
-  done[controlSet.index] = false;
 
+  // Always send an 'off' data point at the start of processing.  That will be
+  // the only point logged, unless watering is needed.
+  data = sendTracePoint(controlSet, off, getDateString());
   if (controlSet.moistureSensor.boolean === false) {
     // Too Dry
     // Mark the trace to show when the watering starts and stops
-    sendChange(controlSet, off[controlSet.index], on[controlSet.index]);
-    waterPlants();
-    sendChange(controlSet, on[controlSet.index], off[controlSet.index]);
-  } else {
-    // Enough moisture
-    // Mark the trace to show we checked the moisture, and did not water
-    sendStillOff(controlSet);
+    data = sendTracePoint(controlSet, on, data.x);
+    waterPlants(controlSet);
+    data = sendTracePoint(controlSet, on, getDateString());
+    data = sendTracePoint(controlSet, off, data.x);
   }
 
   // Close valves and turn pump off
@@ -307,7 +274,12 @@ function controlMoisture(controlSet) {
   allClosedOff();
 
   counter += 1;
-  done[controlSet.index] = true;
+  // Remove (just) finished index from the queue
+  set = waitingQueue.shift();
+  if (set !== controlSet.index) {
+    console.log('Logic error: current process was for', controlSet.index,
+      'but queue said', set);
+  }
 }// ./function controlMoisture(controlSet)
 
 /***
@@ -326,53 +298,95 @@ function controlMoisture(controlSet) {
  * @return {data type}
  */
 function logWatering(msg) {
-  var i;
+  // var i;
   console.log(msg);
   console.log('plotly graph initialized');
 
   // Create the streams for logging the watering events
   // sensor based event processing.
-  for (i = 0; i < nTraces; i += 1) {
-    // Create a stream for logging events to the trace for the current
-    // controls set
-    wateringControls[i].stream = plotly.stream(tokens[i], function (err, res) {
-      if (err) {
-        console.log('setup for stream', i, 'failed:');
-        return console.log(err);
-      }
-      console.log('stream', i, 'setup response:', res);
-    });
-
-    // Setup a function to run each time new data is read from the sensor
-    // (each 'loopTime' ms)
-    wateringControls[i].moistureSensor.on('data', function () {
-      // TODO: might need some extra closure scope init, to keep the 'i' value
-      // var setIndex = i;
-      console.log('running anonymous function for sensor', i);
-      controlMoisture(wateringControls[i]);
-    });
-    //TODO configure sensor barrier, then use .boolean as trigger
-  }
-
+  // TODO: figure out how to get the function/closure scope 'right' when doing
+  // the callback initialization in a loop.  Existing code is getting a value
+  // of nTraces for all of the 'i' references
+  // for (i = 0; i < nTraces; i += 1) {
+  //   // Create a stream for logging events to the trace for the current
+  //   // controls set
+  //   console.log('before create stream for', i);
+  //   wateringControls[i].stream = plotly.stream(tokens[i], function (err, res) {
+  //     if (err) {
+  //       console.log('setup for stream', i, 'failed:');
+  //       return console.log(err);
+  //     }
+  //     console.log('stream', i, 'setup response:', res);
+  //   });
+  //
+  //   // Setup a function to run each time new data is read from the sensor
+  //   // (each 'loopTime' ms)
+  //   wateringControls[i].moistureSensor.on('data', function () {
+  //     // TODO: might need some extra closure scope init, to keep the 'i' value
+  //     // var setIndex = i;
+  //     console.log('running anonymous function for sensor', i);
+  //     controlMoisture(wateringControls[i]);
+  //   });
+  //   console.log('stream', i, 'configured');
+  // }
+  wateringControls[0].stream = plotly.stream(tokens[0], function (err, res) {
+    if (err) {
+      console.log('setup for stream', 0, 'failed:');
+      return console.log(err);
+    }
+    console.log('stream', 0, 'setup response:', res);
+  });
+  wateringControls[1].stream = plotly.stream(tokens[1], function (err, res) {
+    if (err) {
+      console.log('setup for stream', 1, 'failed:');
+      return console.log(err);
+    }
+    console.log('stream', 1, 'setup response:', res);
+  });
+  wateringControls[0].moistureSensor.on('data', function () {
+    controlMoisture(wateringControls[0]);
+  });
+  wateringControls[1].moistureSensor.on('data', function () {
+    controlMoisture(wateringControls[1]);
+  });
+  console.log('sensor processing intialized');
 }// ./function logWatering(msg)
 
 /***
- * Find out if all other controls sets are currently done processing
+ * Send heart beat / keep alive signal to each plotly stream
  *
- * @param {integer} current       The index of the current set being processed
- * @return {boolean}
+ * @return {undefined}
  */
-function othersDone(current) {
-  var i, allDone = true;
+function doHeartbeat() {
+  var i;
+  console.log('heartbeat at', getDateString());
+  // TODO: could filter out heartbeats that occur right after moisture control
   for (i = 0; i < nTraces; i += 1) {
-    if (i !== current) {
-      if (done[i] !== true) {
-        allDone = false;
-      }
-    }
+    wateringControls[i].stream.write('\n');
+    // data point throttling is for json.  No JSON here, so should not need to
+    // insert any artificial delay.
   }
-  return allDone;
-}// ./function othersDone(current)
+}// .//function doHeartbeat
+
+/***
+ * Start heartbeat, to prevent socket error / timeout while waiting for next
+ * actual sensor reading
+ *
+ * @return {undefined}
+ */
+function startHeartbeat() {
+  var heartbeat;
+  // initialize a dummy input, and use reads on it to create a heartbeat for
+  // the streaming data.
+  heartbeat = new five.Sensor({
+    pin: 'A5',
+    freq: heartRate,
+    id: "Heartbeat"
+  });
+
+  heartbeat.on('data', doHeartbeat);
+  console.log('heartbeat processing intialized');
+}// ./function startHeartbeat()
 
 /***
  * Start the main hardware control process.
@@ -397,13 +411,18 @@ function initializeWatering() {
     }
 
     logWatering(msg);
+    startHeartbeat();
+    console.log('watering initialzation done');
   });
+  // TESTING Setup processing, without plotly logging
+  // doWatering();
 }// ./function initializeWatering()
 
 ////////////////////////////////////
 // Start of actual code execution //
 ////////////////////////////////////
 
-board.on('ready', function () {
-  initializeWatering();// Execute this (once) when the slaved Ardunio is ready
-});
+board.on('ready', initializeWatering);
+// board.on('ready', function () {
+//   initializeWatering();// Execute this (once) when the slaved Ardunio is ready
+// });
