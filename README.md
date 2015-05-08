@@ -29,9 +29,3 @@ the functional operation.  It also appears to automatically initialize modes.
 Maybe use Relay for the pump too: It is not currently speed controlled, so that
 is the correct functionality.  A NO relay being used to switch the pump (moter)
 on and off.
-
-```bash
-Fedora install
-# https://www.npmjs.com/package/johnny-five
-npm install johnny-five
-```
