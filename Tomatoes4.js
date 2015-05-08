@@ -173,6 +173,10 @@ function initializeHardware() {
     // Setup a limit for 'too dry, needs water'
     controlPair.moistureSensor.booleanAt(dryValue);
 
+    // Add a property to the sensor so the control set can be easily found when
+    // the sensor is available (in the data.on callback)
+    controlPair.moistureSensor.parentSet = i;
+
     wateringControls.push(controlPair);
     console.log('Sensor and solenoid', i, 'initialized');
   }
@@ -235,11 +239,17 @@ function waterPlants(set) {
 /***
  * Water area when sensor shows it to be too dry
  *
- * @param {object} controlSet     Watering control with related sensor
+ * callback function for repeating (timed) sensor reads
+ *
+ * Stream data to plotly, logging watering events
+ *
  * @return {undefined}
  */
-function controlMoisture(controlSet) {
-  var set, data;
+function controlMoisture() {
+  /* jshint validthis: true */
+  var set, data, controlSet;
+  // console.log(this.id, this.pin, this.value, this.parentSet);
+  controlSet = wateringControls[this.parentSet];
   console.log('controlMoisture for set', controlSet.index);
 
   // NOTE: current testing says queueing is not really needed.  Despite the event
@@ -280,7 +290,25 @@ function controlMoisture(controlSet) {
     console.log('Logic error: current process was for', controlSet.index,
       'but queue said', set);
   }
-}// ./function controlMoisture(controlSet)
+}// ./function controlMoisture()
+
+/***
+ * Handle cleanup when a plotly stream is closed.
+ *
+ * callback function when stream is created
+ *
+ * @param {object} err error object
+ * @return {undefined}
+ */
+function streamFinished(err, res) {
+  /* jshint validthis: true */
+  if (err) {
+    console.log('streaming failed:');
+    return console.log(err);
+  }
+  console.log('streamed response:', res);
+  console.log(this);// Explore the callback context
+}// ./function streamFinished(err, res)
 
 /***
  * Finish setup after plotly has (successfully) completed initialization
@@ -298,57 +326,22 @@ function controlMoisture(controlSet) {
  * @return {data type}
  */
 function logWatering(msg) {
-  // var i;
+  var i;
   console.log(msg);
   console.log('plotly graph initialized');
 
-  // Create the streams for logging the watering events
-  // sensor based event processing.
-  // TODO: figure out how to get the function/closure scope 'right' when doing
-  // the callback initialization in a loop.  Existing code is getting a value
-  // of nTraces for all of the 'i' references
-  // for (i = 0; i < nTraces; i += 1) {
-  //   // Create a stream for logging events to the trace for the current
-  //   // controls set
-  //   console.log('before create stream for', i);
-  //   wateringControls[i].stream = plotly.stream(tokens[i], function (err, res) {
-  //     if (err) {
-  //       console.log('setup for stream', i, 'failed:');
-  //       return console.log(err);
-  //     }
-  //     console.log('stream', i, 'setup response:', res);
-  //   });
-  //
-  //   // Setup a function to run each time new data is read from the sensor
-  //   // (each 'loopTime' ms)
-  //   wateringControls[i].moistureSensor.on('data', function () {
-  //     // TODO: might need some extra closure scope init, to keep the 'i' value
-  //     // var setIndex = i;
-  //     console.log('running anonymous function for sensor', i);
-  //     controlMoisture(wateringControls[i]);
-  //   });
-  //   console.log('stream', i, 'configured');
-  // }
-  wateringControls[0].stream = plotly.stream(tokens[0], function (err, res) {
-    if (err) {
-      console.log('setup for stream', 0, 'failed:');
-      return console.log(err);
-    }
-    console.log('stream', 0, 'setup response:', res);
-  });
-  wateringControls[1].stream = plotly.stream(tokens[1], function (err, res) {
-    if (err) {
-      console.log('setup for stream', 1, 'failed:');
-      return console.log(err);
-    }
-    console.log('stream', 1, 'setup response:', res);
-  });
-  wateringControls[0].moistureSensor.on('data', function () {
-    controlMoisture(wateringControls[0]);
-  });
-  wateringControls[1].moistureSensor.on('data', function () {
-    controlMoisture(wateringControls[1]);
-  });
+  for (i = 0; i < nTraces; i += 1) {
+    // Create a stream for logging events to the trace for the current
+    // controls set
+    // NOTE: have not seen the callback actually excuted.  What w/should trigger
+    // it?  Sample code at github.com/plotly/plotly-nodejs makes it look like
+    // the callback gets executed when the steam is closed.  That never happens
+    // here.
+    wateringControls[i].stream = plotly.stream(tokens[i], streamFinished);
+    // Setup a function to run each time new data is read from the sensor
+    // (each 'loopTime' ms)
+    wateringControls[i].moistureSensor.on('data', controlMoisture);
+  }
   console.log('sensor processing intialized');
 }// ./function logWatering(msg)
 
